@@ -83,12 +83,12 @@ pages.add(
 pages
   .add(
     'orderCollectiveNew',
-    '/:collectiveSlug/:verb(donate|pay|contribute)/:step(contributeAs|details|payment)?',
+    '/:collectiveSlug/:verb(donate|pay|contribute)/:step(contributeAs|details|payment|summary)?',
     'createOrderNewFlow',
   )
   .add(
     'orderCollectiveTierNew',
-    '/:collectiveSlug/:verb(donate|pay|contribute)/tier/:tierId-:tierSlug?/:step(contributeAs|details|payment)?',
+    '/:collectiveSlug/:verb(donate|pay|contribute)/tier/:tierId-:tierSlug?/:step(contributeAs|details|payment|summary)?',
     'createOrderNewFlow',
   )
   .add('orderCollectiveNewSuccess', '/:collectiveSlug/:verb(donate|pay|contribute)/success', 'orderSuccess')

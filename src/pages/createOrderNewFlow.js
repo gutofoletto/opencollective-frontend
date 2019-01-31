@@ -38,8 +38,7 @@ import Container from '../components/Container';
 import { fadeIn } from '../components/StyledKeyframes';
 import MessageBox from '../components/MessageBox';
 import SignInOrJoinFree from '../components/SignInOrJoinFree';
-
-const STEPS = ['contributeAs', 'details', 'payment'];
+import ContributionBreakdown from '../components/ContributionBreakdown';
 
 // Styles for the steps label rendered in StepsProgress
 const StepLabel = styled(Span)`
@@ -124,6 +123,8 @@ class CreateOrderPage extends React.Component {
   };
 
   static errorRecaptchaConnect = "Can't connect to ReCaptcha. Try to reload the page, or disable your Ad Blocker.";
+  static stepsWithTax = ['contributeAs', 'details', 'payment', 'summary'];
+  static stepsWithoutTaxes = ['contributeAs', 'details', 'payment'];
 
   constructor(props) {
     super(props);
@@ -145,8 +146,9 @@ class CreateOrderPage extends React.Component {
   async componentDidMount() {
     // Redirect to previous step if data is missing
     if (!this.isCurrentStepValid()) {
-      const maxStepIdx = this.getMaxStepIdx();
-      this.changeStep(maxStepIdx === 0 ? 'contributeAs' : STEPS[maxStepIdx - 1]);
+      const steps = this.getSteps();
+      const maxStepIdx = this.getMaxStepIdx(steps);
+      this.changeStep(maxStepIdx === 0 ? 'contributeAs' : steps[maxStepIdx - 1]);
     }
 
     // Load payment providers scripts in the background
@@ -170,8 +172,9 @@ class CreateOrderPage extends React.Component {
 
     // Redirect to previous step if data is missing
     if (!this.isCurrentStepValid()) {
-      const maxStepIdx = this.getMaxStepIdx();
-      this.changeStep(maxStepIdx === 0 ? 'contributeAs' : STEPS[maxStepIdx - 1]);
+      const steps = this.getSteps();
+      const maxStepIdx = this.getMaxStepIdx(steps);
+      this.changeStep(maxStepIdx === 0 ? 'contributeAs' : steps[maxStepIdx - 1]);
     }
 
     // Collective was loaded
@@ -202,13 +205,23 @@ class CreateOrderPage extends React.Component {
   async getPaymentMethodToSubmit() {
     const { stepDetails, stepPayment } = this.state;
 
+    // Always ignore payment method for free tiers
     if (this.isFreeTier() && stepDetails.totalAmount === 0) {
       return null;
     }
 
+    // For existing payment methods, just pick the service, type and uuid
     if (!stepPayment.isNew) {
-      return pick(stepPayment.paymentMethod, ['type', 'uuid']);
-    } else if (!this.state.stripe) {
+      return pick(stepPayment.paymentMethod, ['service', 'type', 'uuid']);
+    }
+
+    // New credit card - if no data, stripe token has already been exchanged
+    if (!stepPayment.data && stepPayment.paymentMethod) {
+      return stepPayment.paymentMethod;
+    }
+
+    // New credit card - load info from stripe
+    if (!this.state.stripe) {
       throw new Error('There was a problem initializing the payment form. Please reload the page and try again');
     }
     const { token, error } = await this.state.stripe.createToken();
@@ -221,6 +234,8 @@ class CreateOrderPage extends React.Component {
   async submitOrder(paymentMethodOverride = null) {
     this.setState({ submitting: true, error: null });
     const { stepDetails } = this.state;
+
+    // Load payment method info
     let paymentMethod = null;
     try {
       paymentMethod = paymentMethodOverride || (await this.getPaymentMethodToSubmit());
@@ -228,6 +243,8 @@ class CreateOrderPage extends React.Component {
       this.setState({ submitting: false, error: e.message });
       return false;
     }
+
+    // Load recaptcha token
     const recaptchaToken = await this.fetchRecaptchaToken();
     if (!recaptchaToken) {
       this.setState({ error: CreateOrderPage.errorRecaptchaConnect });
@@ -235,16 +252,16 @@ class CreateOrderPage extends React.Component {
 
     const tier = this.getTier();
     const order = {
+      paymentMethod,
+      recaptchaToken,
+      totalAmount: this.getTotalAmount(),
       quantity: this.props.quantity || 1,
-      totalAmount: stepDetails.totalAmount,
       currency: this.getCurrency(),
       interval: stepDetails.interval,
-      paymentMethod,
       referral: this.props.referral,
       fromCollective: pick(this.state.stepProfile, ['id', 'type', 'name']),
       collective: pick(this.props.data.Collective, ['id']),
-      tier: tier ? pick(this.getTier(), ['id', 'amount']) : undefined,
-      recaptchaToken,
+      tier: tier ? pick(tier, ['id', 'amount']) : undefined,
       description: decodeURIComponent(this.props.description || ''),
     };
 
@@ -320,13 +337,31 @@ class CreateOrderPage extends React.Component {
     return get(this.state.stepDetails, 'totalAmount') || get(tier, 'amount') || amountFromUrl;
   }
 
+  /** Get total amount based on stepDetails with taxes applied */
+  getTotalAmount() {
+    const totalAmount = get(this.state, 'stepDetails.totalAmount', 0);
+    const tax = this.getTax();
+    return tax ? Math.trunc(totalAmount * (1 + tax.percentage / 100)) : totalAmount;
+  }
+
   /** Teturn true if current order doesn't need any payment */
   isFreeTier() {
     return this.getOrderMinAmount() === 0;
   }
 
+  /** Returns the tax linked to the current tier, or null if none */
+  getTax() {
+    const tier = this.getTier();
+    return tier ? get(this.props.data.Collective, `host.settings.tiersTaxes.${tier.type}`) : null;
+  }
+
+  /** Returs the steps list */
+  getSteps() {
+    return this.getTax() ? CreateOrderPage.stepsWithTax : CreateOrderPage.stepsWithoutTaxes;
+  }
+
   /** Return the index of the last step user can switch to */
-  getMaxStepIdx() {
+  getMaxStepIdx(steps) {
     // Validate step profile
     if (!this.state.stepProfile) return 0;
 
@@ -337,14 +372,15 @@ class CreateOrderPage extends React.Component {
     // Validate step payment
     if (this.state.stepDetails.totalAmount === 0 && this.isFreeTier()) return 3;
     if (!this.state.stepPayment || this.state.stepPayment.error) return 2;
-    return STEPS.length;
+    return steps.length;
   }
 
   /** Return true if we're not missing data from previous steps */
   isCurrentStepValid() {
-    const stepIdx = STEPS.indexOf(this.props.step);
-    const maxStepIdx = this.getMaxStepIdx();
-    return stepIdx === -1 || stepIdx <= maxStepIdx || maxStepIdx >= STEPS.length;
+    const steps = this.getSteps();
+    const stepIdx = steps.indexOf(this.props.step);
+    const maxStepIdx = this.getMaxStepIdx(steps);
+    return stepIdx === -1 || stepIdx <= maxStepIdx || maxStepIdx >= steps.length;
   }
 
   /** Get currency from the current tier, or fallback on collective currency */
@@ -390,15 +426,15 @@ class CreateOrderPage extends React.Component {
     }
   }
 
-  renderPrevStepButton(step) {
-    const prevStepIdx = STEPS.indexOf(step) - 1;
+  renderPrevStepButton(steps, step) {
+    const prevStepIdx = steps.indexOf(step) - 1;
     if (prevStepIdx < 0) {
       return null;
     }
 
     return (
       <PrevNextButton
-        onClick={() => this.changeStep(STEPS[prevStepIdx])}
+        onClick={() => this.changeStep(steps[prevStepIdx])}
         buttonStyle="standard"
         disabled={this.state.submitting || this.state.submitted}
       >
@@ -407,19 +443,20 @@ class CreateOrderPage extends React.Component {
     );
   }
 
-  renderNextStepButton(step) {
-    const stepIdx = STEPS.indexOf(step);
+  renderNextStepButton(steps, step) {
+    const stepIdx = steps.indexOf(step);
     if (stepIdx === -1) {
       return null;
     }
 
-    const isLast = stepIdx + 1 >= STEPS.length;
-    const canGoNext = stepIdx + 1 <= this.getMaxStepIdx();
-    const isPaypal = canGoNext && isLast && get(this.state, 'stepPayment.paymentMethod.type') === 'paypal';
+    const isLast = stepIdx + 1 >= steps.length;
+    const canGoNext = stepIdx + 1 <= this.getMaxStepIdx(steps);
+    const isPaypal = canGoNext && isLast && get(this.state, 'stepPayment.paymentMethod.service') === 'paypal';
+
     return isPaypal ? (
       <PaypalButtonContainer>
         <PayWithPaypalButton
-          totalAmount={get(this.state, 'stepDetails.totalAmount')}
+          totalAmount={this.getTotalAmount()}
           currency={this.getCurrency()}
           style={{ size: 'responsive', height: 55 }}
           onClick={() => this.setState({ submitting: true })}
@@ -431,12 +468,12 @@ class CreateOrderPage extends React.Component {
     ) : (
       <PrevNextButton
         buttonStyle="primary"
-        onClick={() => (isLast ? this.submitOrder() : this.changeStep(STEPS[stepIdx + 1]))}
+        onClick={() => (isLast ? this.submitOrder() : this.changeStep(steps[stepIdx + 1]))}
         disabled={this.state.submitting || !canGoNext || this.state.submitted}
         loading={this.state.submitting}
       >
         {isLast ? (
-          <FormattedMessage id="contribute.submit" defaultMessage="Submit" />
+          <FormattedMessage id="contribute.submit" defaultMessage="Make contribution" />
         ) : (
           <FormattedMessage id="contribute.nextStep" defaultMessage="Next step" />
         )}{' '}
@@ -455,10 +492,11 @@ class CreateOrderPage extends React.Component {
   }
 
   renderStep(step) {
-    const { LoggedInUser } = this.props;
-    const { stepDetails } = this.state;
+    const { LoggedInUser, data } = this.props;
+    const { stepDetails, stepPayment } = this.state;
     const [personal, profiles] = this.getProfiles();
     const tier = this.getTier();
+    const tax = this.getTax();
 
     if (step === 'contributeAs') {
       return (
@@ -527,11 +565,27 @@ class CreateOrderPage extends React.Component {
             onChange={stepPayment => this.setState({ stepPayment })}
             paymentMethods={get(LoggedInUser, 'collective.paymentMethods', [])}
             collective={this.state.stepProfile}
-            defaultValue={this.state.stepPayment}
+            defaultValue={stepPayment}
             onNewCardFormReady={({ stripe }) => this.setState({ stripe })}
             withPaypal={this.hasPaypal()}
             manual={this.getManualPaymentMethod()}
             margins="0 auto"
+          />
+        </Flex>
+      );
+    } else if (step === 'summary') {
+      return (
+        <Flex flexDirection="column" width={1} css={{ maxWidth: 480 }}>
+          <H5 textAlign="left" mb={3}>
+            <FormattedMessage id="contribute.summary.breakdown" defaultMessage="Contribution breakdown:" />
+          </H5>
+          <ContributionBreakdown
+            amount={get(stepDetails, 'totalAmount')}
+            currency={this.getCurrency()}
+            hostFeePercent={get(data, 'Collective.hostFeePercent')}
+            taxName={get(tax, 'name')}
+            taxPercent={get(tax, 'percentage')}
+            paymentMethod={get(stepPayment, 'paymentMethod')}
           />
         </Flex>
       );
@@ -563,10 +617,25 @@ class CreateOrderPage extends React.Component {
         this.setState({ stepProfile: createdOrg, submitting: false });
       } catch (error) {
         this.setState({ error: error.message, submitting: false });
+        return false;
       }
     } else if (currentStep === 'details' && step === 'payment') {
       // Validate ContributeDetails step before going next
       if (!this.contributeDetailsFormRef.current || !this.contributeDetailsFormRef.current.reportValidity()) {
+        return false;
+      }
+    } else if (currentStep === 'payment' && step === 'summary') {
+      // Load credit card info from stripe before going to summary
+      try {
+        this.setState({ submitting: true });
+        const paymentMethod = await this.getPaymentMethodToSubmit();
+        this.setState(state => ({
+          ...state,
+          stepPayment: { ...state.stepPayment, paymentMethod, data: null },
+          submitting: false,
+        }));
+      } catch (e) {
+        this.setState({ error: e.message, submitting: false });
         return false;
       }
     }
@@ -601,17 +670,19 @@ class CreateOrderPage extends React.Component {
     );
   }
 
-  renderStepsProgress(currentStep) {
+  renderStepsProgress(allSteps, currentStep) {
     const { stepProfile, stepDetails, stepPayment, submitted } = this.state;
     const loading = this.props.loadingLoggedInUser || this.state.loading || this.state.submitting;
+    const steps = allSteps.filter(s => s !== 'summary'); // Hide summary step in progress
+
     return (
       <StepsProgress
-        steps={STEPS}
+        steps={steps}
         focus={currentStep}
-        allCompleted={submitted}
+        allCompleted={submitted || currentStep === 'summary'}
         onStepSelect={!loading && !submitted ? this.changeStep : undefined}
         loadingStep={loading ? currentStep : undefined}
-        disabledSteps={STEPS.slice(this.getMaxStepIdx(), STEPS.length)}
+        disabledSteps={steps.slice(this.getMaxStepIdx(steps), steps.length)}
       >
         {({ step }) => {
           let label = null;
@@ -649,7 +720,7 @@ class CreateOrderPage extends React.Component {
     );
   }
 
-  renderContent() {
+  renderContent(steps) {
     const { LoggedInUser } = this.props;
 
     if (!LoggedInUser) {
@@ -661,8 +732,8 @@ class CreateOrderPage extends React.Component {
       <Flex flexDirection="column" alignItems="center" mx={3} width={0.95}>
         {this.renderStep(step)}
         <Flex mt={[4, null, 5]} justifyContent="center" flexWrap="wrap">
-          {this.renderPrevStepButton(step)}
-          {this.renderNextStepButton(step)}
+          {this.renderPrevStepButton(steps, step)}
+          {this.renderNextStepButton(steps, step)}
         </Flex>
       </Flex>
     );
@@ -678,6 +749,7 @@ class CreateOrderPage extends React.Component {
     const collective = data.Collective;
     const logo = collective.image || get(collective.parentCollective, 'image');
     const isLoadingContent = loadingLoggedInUser || data.loading || !this.isCurrentStepValid();
+    const steps = this.getSteps();
     const tier = this.getTier();
 
     return (
@@ -723,7 +795,7 @@ class CreateOrderPage extends React.Component {
           {loadingLoggedInUser ||
             (LoggedInUser && (
               <Box mb={[3, null, 4]} width={0.8} css={{ maxWidth: 365, minHeight: 95 }}>
-                {this.renderStepsProgress(this.props.step || 'contributeAs')}
+                {this.renderStepsProgress(steps, this.props.step || 'contributeAs')}
               </Box>
             ))}
           {this.state.error && (
@@ -731,7 +803,7 @@ class CreateOrderPage extends React.Component {
               {this.state.error.replace('GraphQL error: ', '')}
             </MessageBox>
           )}
-          {isLoadingContent ? <Loading /> : this.renderContent()}
+          {isLoadingContent ? <Loading /> : this.renderContent(steps)}
         </Flex>
       </Page>
     );
@@ -751,6 +823,7 @@ const addData = graphql(gql`
       image
       backgroundImage
       currency
+      hostFeePercent
       tags
       host {
         id
